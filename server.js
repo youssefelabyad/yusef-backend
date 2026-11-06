@@ -32,7 +32,7 @@ app.get('/api/me', async (req, res) => {
 
 app.get('/api/profile', async (req, res) => {
   try {
-    const data = await fbFetch(`/${IG_ID}?fields=id,username,account_type,media_count,followers_count,follows_count,biography,profile_picture_url,website`);
+    const data = await fbFetch(`/${IG_ID}?fields=id,username,name,media_count,followers_count,follows_count,biography,profile_picture_url,website`);
     res.json({ ...data, source: 'Live API' });
   } catch (e) { res.status(500).json({ error: e.message, source: 'Live API' }); }
 });
