@@ -7,12 +7,12 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const IG_ID = process.env.INSTAGRAM_ID || '17841405344844788';
-const TOKEN = process.env.INSTAGRAM_ACCESS_TOKEN; // Set in Railway/Vercel Env Vars
+const IG_ID = process.env.【entity-INSTAGRAM_ID¦canonical_name=Instagram】 || '17841405344844788';
+const TOKEN = process.env.【entity-INSTAGRAM_ACCESS_TOKEN¦canonical_name=Instagram】;
 const FB_API = 'https://graph.facebook.com/v21.0';
 
 async function fbFetch(path) {
-  if (!TOKEN) throw new Error('Missing INSTAGRAM_ACCESS_TOKEN env var');
+  if (!TOKEN) throw new Error('Missing 【entity-INSTAGRAM_ACCESS_TOKEN¦canonical_name=Instagram】 env var');
   const url = `${FB_API}${path}${path.includes('?') ? '&' : '?'}access_token=${TOKEN}`;
   const r = await fetch(url);
   const data = await r.json();
@@ -20,7 +20,7 @@ async function fbFetch(path) {
   return data;
 }
 
-app.get('/api/health', (req, res) => res.json({ ok: true, instagram_id: IG_ID, has_token: !!TOKEN }));
+app.get('/api/health', (req, res) => res.json({ ok: true, 【entity-instagram_id¦canonical_name=Instagram】: IG_ID, has_token: !!TOKEN }));
 
 app.get('/api/me', async (req, res) => {
   try {
@@ -31,7 +31,7 @@ app.get('/api/me', async (req, res) => {
 
 app.get('/api/profile', async (req, res) => {
   try {
-    const data = await fbFetch(`/${IG_ID}?fields=id,username,account_type,media_count,followers_count,follows_count,biography,profile_picture_url,website`);
+    const data = await fbFetch(`/${IG_ID}?fields=id,username,name,biography,media_count,followers_count,follows_count,profile_picture_url,website`);
     res.json({ ...data, source: 'Live API' });
   } catch (e) { res.status(500).json({ error: e.message, source: 'Live API' }); }
 });
