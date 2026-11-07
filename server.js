@@ -324,7 +324,7 @@ async function fbFetch(path) {
   if (data.error) throw new Error(data.error.message);
   return data;
 }
-app.get('/api/health', (req, res) => res.json({ ok: true, version: 'V21.4', status: 'online', db: pgPool ? 'Postgres' : 'Memory (dev only)', db_configured: !!pgPool, encryption_configured: !!getEncryptionKey(), tiktok_connected: !!TIKTOK_STORE.access_token, youtube_connected: !!YOUTUBE_STORE.access_token, instagram_configured: !!TOKEN, timestamp: new Date().toISOString() }));
+app.get('/api/health', (req, res) => res.json({ ok: true, version: 'V22.1', status: 'online', db: pgPool ? 'Postgres' : 'Memory (dev only)', db_configured: !!pgPool, encryption_configured: !!getEncryptionKey(), tiktok_connected: !!TIKTOK_STORE.access_token, youtube_connected: !!YOUTUBE_STORE.access_token, instagram_configured: !!TOKEN, timestamp: new Date().toISOString() }));
 app.get('/api/me', requireInstagram, async (req, res) => {
   try { const data = await fbFetch(`/me/accounts?fields=id,name,instagram_business_account{id,username}`); res.json(data); }
   catch (e) { res.status(500).json({ error: e.message }); }
