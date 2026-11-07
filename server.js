@@ -1,4 +1,5 @@
-// Youssef Elabyad - Social Media Intelligence Platform - Backend V21.4
+
+// Youssef Elabyad - Social Media Intelligence Platform - Backend V22.1
 // Instagram + TikTok - Production Readiness Fixes (Audit V21)
 // Instagram logic preserved (profile/media/insights internal logic untouched, only auth wrapper + health). V21.3: Separate Instagram session (NOT TikTok session) + Single /api/health + Fail-fast before listen + CSRF for POSTs.
 // Identity vs Platform: yusef_session grants ['tiktok'] only, ig_session grants ['instagram'] only. TikTok session NEVER grants Instagram.
@@ -95,6 +96,13 @@ function destroyInstagramSession(req, res){
   if (cookies['ig_session']) IG_SESSIONS.delete(cookies['ig_session']);
   clearCookie(res, 'ig_session', '/');
 }
+const YT_SESSIONS=new Map();
+function createYouTubeSession(){ const id=crypto.randomBytes(32).toString('hex'); YT_SESSIONS.set(id,{createdAt:Date.now(),expiresAt:Date.now()+24*3600*1000,grants:['youtube']}); return id; }
+function isValidYouTubeSession(req){ const c=parseCookies(req); const sid=c['yt_session']; if(!sid) return false; const v=YT_SESSIONS.get(sid); if(!v) return false; if(Date.now()>v.expiresAt){ YT_SESSIONS.delete(sid); return false; } if(!v.grants||!v.grants.includes('youtube')) return false; return true; }
+function requireYouTube(req,res,next){ if(!isValidYouTubeSession(req)) return res.status(401).json({error:'Unauthorized - login via /api/youtube/login first',code:'unauthorized_youtube'}); return next(); }
+function destroyYouTubeSession(req,res){ const c=parseCookies(req); if(c['yt_session']) YT_SESSIONS.delete(c['yt_session']); clearCookie(res,'yt_session','/'); }
+function createYouTubeOAuthState(res){ const st=crypto.randomBytes(32).toString('hex'); setCookie(res,'youtube_oauth_state',st,{path:'/api/youtube/callback',maxAge:600}); return st; }
+function validateYouTubeOAuthState(req){ const c=parseCookies(req); const a=c['youtube_oauth_state']; const q=req.query.state; if(!a||!q) return false; try{ const x=Buffer.from(a,'utf8'); const y=Buffer.from(String(q),'utf8'); if(x.length!==y.length) return false; return crypto.timingSafeEqual(x,y); }catch{ return false; } }
 
 // ===== RATE LIMITING for Instagram Login (V21.4) - Prevent guessing DASHBOARD_ADMIN_KEY =====
 // Per-IP: max 5 failed attempts per 15 min window, then blocked for 15 min.
@@ -168,7 +176,7 @@ function validateOAuthState(req){
 const PLATFORMS = {
   instagram: { id: 'instagram', name: 'Instagram', scopes: ['instagram_basic'] },
   tiktok: { id: 'tiktok', name: 'TikTok', scopes: ['user.info.profile','user.info.stats','video.list'] },
-  youtube: { id: 'youtube', name: 'YouTube', scopes: [], status: 'coming_soon' },
+  youtube: { id: 'youtube', name: 'YouTube', scopes: ['https://www.googleapis.com/auth/youtube.readonly'] },
   facebook: { id: 'facebook', name: 'Facebook', scopes: [], status: 'coming_soon' },
   linkedin: { id: 'linkedin', name: 'LinkedIn', scopes: [], status: 'coming_soon' },
   x: { id: 'x', name: 'X', scopes: [], status: 'coming_soon' },
@@ -179,6 +187,7 @@ function getPlatformsStatus(){
   return Object.values(PLATFORMS).map(p => {
     if (p.id === 'instagram') return { id: p.id, name: p.name, status: (process.env.INSTAGRAM_ACCESS_TOKEN ? 'connected' : 'not_connected'), scopes: p.scopes };
     if (p.id === 'tiktok') return { id: p.id, name: p.name, status: (TIKTOK_STORE.access_token ? 'connected' : 'not_connected'), scopes: p.scopes };
+    if (p.id === 'youtube') return { id: p.id, name: p.name, status: (YOUTUBE_STORE.access_token ? 'connected' : 'not_connected'), scopes: p.scopes };
     return { id: p.id, name: p.name, status: p.status || 'coming_soon', scopes: p.scopes };
   });
 }
@@ -229,6 +238,7 @@ async function dbInit(){
   if (!pgPool) return false;
   try {
     await pgPool.query(`CREATE TABLE IF NOT EXISTS tiktok_tokens (id INT PRIMARY KEY CHECK (id = 1), access_token TEXT, refresh_token TEXT, expires_at BIGINT, open_id TEXT, scope TEXT, updated_at TIMESTAMPTZ DEFAULT NOW())`);
+    await pgPool.query(`CREATE TABLE IF NOT EXISTS youtube_tokens (id INT PRIMARY KEY CHECK (id = 1), access_token TEXT, refresh_token TEXT, expires_at BIGINT, channel_id TEXT, scope TEXT, updated_at TIMESTAMPTZ DEFAULT NOW())`);
     return true;
   } catch (e) { console.log('[DB] init failed (no secrets):', e.message); return false; }
 }
@@ -277,6 +287,12 @@ async function dbClearToken(userId = 'default'){
   await pgPool.query(`DELETE FROM tiktok_tokens WHERE id = 1`);
   return true;
 }
+async function dbSaveYouTubeToken(store){ if(!pgPool) return false; const a=store.access_token?encryptToken(store.access_token):null; const b=store.refresh_token?encryptToken(store.refresh_token):null; await pgPool.query(`INSERT INTO youtube_tokens (id, access_token, refresh_token, expires_at, channel_id, scope, updated_at) VALUES (1, $1, $2, $3, $4, $5, NOW()) ON CONFLICT (id) DO UPDATE SET access_token=EXCLUDED.access_token, refresh_token=EXCLUDED.refresh_token, expires_at=EXCLUDED.expires_at, channel_id=EXCLUDED.channel_id, scope=EXCLUDED.scope, updated_at=NOW()`,[a,b,store.expires_at,store.channel_id,store.scope]); return true; }
+async function dbLoadYouTubeToken(){ if(!pgPool) return null; const r=await pgPool.query(`SELECT access_token, refresh_token, expires_at, channel_id, scope FROM youtube_tokens WHERE id = 1`); if(!r.rows.length) return null; const row=r.rows[0]; return { access_token: row.access_token?decryptToken(row.access_token):null, refresh_token: row.refresh_token?decryptToken(row.refresh_token):null, expires_at: row.expires_at?Number(row.expires_at):null, channel_id: row.channel_id, scope: row.scope }; }
+async function dbClearYouTubeToken(){ if(!pgPool) return false; await pgPool.query(`DELETE FROM youtube_tokens WHERE id = 1`); return true; }
+const YOUTUBE_STORE={access_token:null,refresh_token:null,expires_at:null,channel_id:null,scope:null};
+async function persistYouTubeToken(){ if(!pgPool) return false; if(!dbReady) dbReady=await dbInit(); try{ await dbSaveYouTubeToken(YOUTUBE_STORE); return true; }catch(e){ console.log('[DB] YouTube persist failed:',e.message); return false; } }
+async function loadYouTubeTokenOnBoot(){ if(!pgPool) return; try{ const l=await dbLoadYouTubeToken(); if(l&&l.access_token){ Object.assign(YOUTUBE_STORE,l); console.log('[DB] YouTube token restored.'); } else console.log('[DB] No persisted YouTube token.'); }catch(e){ console.log('[DB] YouTube load failed:',e.message); } }
 // Token store in memory mirrors DB (fast read). DB is source of truth on restart.
 const TIKTOK_STORE = { access_token: null, refresh_token: null, expires_at: null, open_id: null, scope: null };
 let dbReady = false;
@@ -308,7 +324,7 @@ async function fbFetch(path) {
   if (data.error) throw new Error(data.error.message);
   return data;
 }
-app.get('/api/health', (req, res) => res.json({ ok: true, version: 'V21.4', status: 'online', db: pgPool ? 'Postgres' : 'Memory (dev only)', db_configured: !!pgPool, encryption_configured: !!getEncryptionKey(), tiktok_connected: !!TIKTOK_STORE.access_token, instagram_configured: !!TOKEN, timestamp: new Date().toISOString() }));
+app.get('/api/health', (req, res) => res.json({ ok: true, version: 'V21.4', status: 'online', db: pgPool ? 'Postgres' : 'Memory (dev only)', db_configured: !!pgPool, encryption_configured: !!getEncryptionKey(), tiktok_connected: !!TIKTOK_STORE.access_token, youtube_connected: !!YOUTUBE_STORE.access_token, instagram_configured: !!TOKEN, timestamp: new Date().toISOString() }));
 app.get('/api/me', requireInstagram, async (req, res) => {
   try { const data = await fbFetch(`/me/accounts?fields=id,name,instagram_business_account{id,username}`); res.json(data); }
   catch (e) { res.status(500).json({ error: e.message }); }
@@ -535,11 +551,143 @@ app.get('/api/tiktok/analytics', requireSession, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+
+// ===== YOUTUBE CONNECTOR (V22.1) =====
+const YOUTUBE_CLIENT_ID = process.env.YOUTUBE_CLIENT_ID;
+const YOUTUBE_CLIENT_SECRET = process.env.YOUTUBE_CLIENT_SECRET;
+const YOUTUBE_REDIRECT = process.env.YOUTUBE_REDIRECT_URI || 'https://yusef-backend-production.up.railway.app/api/youtube/callback';
+const YOUTUBE_SCOPES = ['https://www.googleapis.com/auth/youtube.readonly', 'openid', 'email'];
+function isYouTubeExpired(){ if(!YOUTUBE_STORE.expires_at) return false; return Date.now() > YOUTUBE_STORE.expires_at - 60000; }
+let youtubeRefreshPromise = null;
+async function youtubeRefresh(){
+  if (youtubeRefreshPromise) return youtubeRefreshPromise;
+  youtubeRefreshPromise = (async () => {
+    if(!YOUTUBE_STORE.refresh_token) throw new Error('No refresh token - re-login required');
+    const oldRefresh = YOUTUBE_STORE.refresh_token;
+    const r = await fetch('https://oauth2.googleapis.com/token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ client_id: YOUTUBE_CLIENT_ID, client_secret: YOUTUBE_CLIENT_SECRET, grant_type: 'refresh_token', refresh_token: oldRefresh }) });
+    const data = await r.json();
+    if(data.error) throw new Error(data.error_description || data.error);
+    const next = { access_token: data.access_token, refresh_token: data.refresh_token || oldRefresh, expires_at: data.expires_in ? Date.now() + data.expires_in*1000 : YOUTUBE_STORE.expires_at, channel_id: YOUTUBE_STORE.channel_id, scope: YOUTUBE_STORE.scope };
+    const prev = { ...YOUTUBE_STORE };
+    Object.assign(YOUTUBE_STORE, next);
+    const ok = await persistYouTubeToken();
+    if (!ok) { Object.assign(YOUTUBE_STORE, prev); throw new Error('Refresh succeeded but persist failed - old token kept'); }
+    return YOUTUBE_STORE;
+  })();
+  try { return await youtubeRefreshPromise; } finally { youtubeRefreshPromise = null; }
+}
+async function getValidYouTubeToken(){
+  if(!YOUTUBE_STORE.access_token) throw new Error('Not connected - open /api/youtube/login first');
+  if(isYouTubeExpired()){ try{ await youtubeRefresh(); }catch(e){ throw new Error('Session expired - re-login required: ' + e.message); } }
+  return YOUTUBE_STORE.access_token;
+}
+async function youtubeApi(path){
+  let lastErr = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const token = await getValidYouTubeToken();
+      const r = await fetch('https://www.googleapis.com/youtube/v3/' + path, { headers: { Authorization: 'Bearer ' + token } });
+      if (r.status === 429) { if (attempt === 2) throw new Error('YouTube rate limit - please retry in a few seconds'); await sleep(Math.min(1000 * Math.pow(2, attempt), 4000)); continue; }
+      const data = await r.json();
+      if (data.error) throw new Error(data.error.message || 'YouTube API error');
+      return data;
+    } catch (e) { lastErr = e; if (e.message && e.message.includes('rate limit')) { if (attempt === 2) throw e; await sleep(1000 * Math.pow(2, attempt)); continue; } throw e; }
+  }
+  throw lastErr || new Error('YouTube API failed');
+}
+function computeYouTubeAnalytics(channel, videos){
+  const list = videos || [];
+  const totalViews = list.reduce((a,v)=>a+(v.viewCount||0),0);
+  const totalLikes = list.reduce((a,v)=>a+(v.likeCount||0),0);
+  const totalComments = list.reduce((a,v)=>a+(v.commentCount||0),0);
+  const avgViews = list.length ? Math.round(totalViews/list.length) : 0;
+  const engagementRate = totalViews ? Number((((totalLikes+totalComments)/totalViews)*100).toFixed(2)) : null;
+  const sorted = [...list].sort((a,b)=>(b.viewCount||0)-(a.viewCount||0));
+  const now = Date.now();
+  const inDays = (d)=> list.filter(v=> v.publishedAt && (now - new Date(v.publishedAt).getTime()) < d*86400000);
+  const sumViews = (arr)=> arr.reduce((a,v)=>a+(v.viewCount||0),0);
+  let bestHour = null;
+  if(list.length >= 3){ const byHour={}; list.forEach(v=>{ const h=new Date(v.publishedAt).getHours(); byHour[h]=(byHour[h]||0)+(v.viewCount||0); }); let bh=0,bv=-1; for(const h in byHour){ if(byHour[h]>bv){bv=byHour[h]; bh=Number(h);} } bestHour=bh; }
+  const stats = channel?.statistics || {}; const sn = channel?.snippet || {};
+  return { source:'Live YouTube API', computed_from: list.length+' videos', account:{ channel_id: channel?.id||null, title: sn.title||null, custom_url: sn.customUrl||null, description: sn.description||null, thumbnail_url: sn.thumbnails?.default?.url||sn.thumbnails?.medium?.url||null, subscriber_count: stats.subscriberCount?Number(stats.subscriberCount):null, video_count: stats.videoCount?Number(stats.videoCount):null, view_count: stats.viewCount?Number(stats.viewCount):null, hidden_subscriber_count: stats.hiddenSubscriberCount??null }, content:{ total_videos:list.length, total_views:totalViews, total_likes:totalLikes, total_comments:totalComments, avg_views:avgViews, engagement_rate_pct:engagementRate, best_video:sorted[0]||null, worst_video:sorted[sorted.length-1]||null, videos:sorted }, performance:{ last_7d_views:sumViews(inDays(7)), last_30d_views:sumViews(inDays(30)), last_90d_views:sumViews(inDays(90)), last_7d_count:inDays(7).length, last_30d_count:inDays(30).length, last_90d_count:inDays(90).length, best_posting_hour:bestHour, best_posting_hour_status: bestHour===null?'Unavailable - need at least 3 videos':'Real - computed from video publishedAt' }, audience:{ status:'Unavailable', reason:'YouTube Data API v3 (youtube.readonly) does not provide demographics or subscriber growth history. Requires YouTube Analytics API + approval.', demographics:null, subscriber_growth:null }, transparency:{ real:['subscriber_count','video_count','view_count','video views/likes/comments','publishedAt'], unavailable:['audience demographics','subscriber growth history','trend data','competitor data'], permission_required:['YouTube Analytics API for demographics/growth'] } };
+}
+app.get('/api/youtube/status', requireYouTube, (req, res) => res.json({ ok:true, connected: !!YOUTUBE_STORE.access_token, has_client_id: !!YOUTUBE_CLIENT_ID, has_client_secret: !!YOUTUBE_CLIENT_SECRET, has_refresh_token: !!YOUTUBE_STORE.refresh_token, expires_at: YOUTUBE_STORE.expires_at, channel_id: YOUTUBE_STORE.channel_id, redirect_uri: YOUTUBE_REDIRECT, scopes: YOUTUBE_SCOPES, storage: pgPool ? 'Postgres (persistent, encrypted)' : 'Memory (fallback)' }));
+app.get('/api/youtube/login', (req, res) => {
+  if (!YOUTUBE_CLIENT_ID) return res.status(500).json({ error: 'Missing YOUTUBE_CLIENT_ID env var' });
+  const state = createYouTubeOAuthState(res);
+  const scope = encodeURIComponent(YOUTUBE_SCOPES.join(' '));
+  const url = 'https://accounts.google.com/o/oauth2/v2/auth?client_id=' + encodeURIComponent(YOUTUBE_CLIENT_ID) + '&redirect_uri=' + encodeURIComponent(YOUTUBE_REDIRECT) + '&response_type=code&scope=' + scope + '&access_type=offline&prompt=consent&state=' + state;
+  res.redirect(url);
+});
+app.get('/api/youtube/callback', async (req, res) => {
+  const { code, error } = req.query;
+  const stateOk = validateYouTubeOAuthState(req);
+  clearCookie(res, 'youtube_oauth_state', '/api/youtube/callback');
+  if (!stateOk) return res.status(403).send('Invalid or missing OAuth state (CSRF protection) - please start login again via /api/youtube/login');
+  if (error) return res.status(400).send('YouTube auth error: ' + error);
+  if (!code) return res.status(400).send('Missing code');
+  try {
+    const r = await fetch('https://oauth2.googleapis.com/token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ code, client_id: YOUTUBE_CLIENT_ID, client_secret: YOUTUBE_CLIENT_SECRET, redirect_uri: YOUTUBE_REDIRECT, grant_type: 'authorization_code' }) });
+    const data = await r.json();
+    if (data.error) throw new Error(data.error_description || data.error);
+    const prev = { ...YOUTUBE_STORE };
+    Object.assign(YOUTUBE_STORE, { access_token: data.access_token, refresh_token: data.refresh_token || null, channel_id: null, scope: data.scope || null, expires_at: data.expires_in ? Date.now() + data.expires_in*1000 : null });
+    try { const ch = await fetch('https://www.googleapis.com/youtube/v3/channels?part=id&mine=true', { headers: { Authorization: 'Bearer ' + YOUTUBE_STORE.access_token } }); const cj = await ch.json(); if (cj.items && cj.items[0]) YOUTUBE_STORE.channel_id = cj.items[0].id; } catch {}
+    const ok = await persistYouTubeToken();
+    if (!ok) { Object.assign(YOUTUBE_STORE, prev); return res.status(503).send('storage_degraded: Token received but NOT persisted in Postgres. Check DATABASE_URL + TOKEN_ENCRYPTION_KEY, then retry login. Not connected.'); }
+    const sid = createYouTubeSession();
+    setCookie(res, 'yt_session', sid, { path: '/', maxAge: 24*3600 });
+    res.send('<h1>YouTube connected</h1><p>Token + Refresh Token saved in Postgres (encrypted, persistent). Session created. You can close this and open your dashboard.</p><p><a href="https://yusef-delta.vercel.app">Open Dashboard</a></p>');
+  } catch (e) { res.status(500).send('Token exchange failed: ' + e.message); }
+});
+app.get('/api/youtube/refresh', requireYouTube, async (req, res) => { try { const s = await youtubeRefresh(); res.json({ ok:true, has_token: !!s.access_token, expires_at: s.expires_at, storage: pgPool ? 'Postgres' : 'Memory' }); } catch(e){ res.status(500).json({ error: e.message }); } });
+app.post('/api/youtube/disconnect', requireYouTube, requireCSRF, async (req, res) => {
+  let revokeOk = null, revokeError = null;
+  const t = YOUTUBE_STORE.access_token;
+  if (t) { try { const rr = await fetch('https://oauth2.googleapis.com/revoke', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ token: t }) }); if (rr.status === 200) revokeOk = true; else { const rj = await rr.json().catch(()=>({})); revokeOk = false; revokeError = rj.error_description || rj.error || ('HTTP ' + rr.status); } } catch(e){ revokeOk = false; revokeError = e.message; } }
+  try { if (pgPool) { await dbClearYouTubeToken(); } else { return res.status(503).json({ error: 'storage_degraded: Postgres not available', code: 'storage_degraded', connected: true }); } } catch(e){ return res.status(503).json({ error: 'storage_degraded: Failed to delete tokens - still connected.', code: 'storage_degraded', connected: true, revoke_ok: revokeOk, revoke_error: revokeError }); }
+  YOUTUBE_STORE.access_token = null; YOUTUBE_STORE.refresh_token = null; YOUTUBE_STORE.expires_at = null; YOUTUBE_STORE.channel_id = null; YOUTUBE_STORE.scope = null;
+  destroyYouTubeSession(req, res);
+  res.json({ ok:true, connected:false, message:'YouTube disconnected. Re-login via /api/youtube/login to reconnect.', revoke_ok: revokeOk, revoke_error: revokeError });
+});
+app.get('/api/youtube/channel', requireYouTube, async (req, res) => {
+  try { const data = await youtubeApi('channels?part=snippet,statistics,contentDetails&mine=true'); const ch = (data.items && data.items[0]) || null; if (!ch) return res.status(404).json({ error: 'No YouTube channel found for this account' }); if (ch.id) YOUTUBE_STORE.channel_id = ch.id; res.json({ ...ch, source: 'Live YouTube API', transparency: 'Real' }); } catch (e) { res.status(500).json({ error: e.message, source: 'Live YouTube API' }); }
+});
+app.get('/api/youtube/videos', requireYouTube, async (req, res) => {
+  try {
+    let cid = YOUTUBE_STORE.channel_id;
+    if (!cid) { const ch = await youtubeApi('channels?part=id&mine=true'); cid = ch.items?.[0]?.id; if (cid) YOUTUBE_STORE.channel_id = cid; }
+    if (!cid) return res.status(404).json({ error: 'No YouTube channel found' });
+    const search = await youtubeApi('search?part=snippet&channelId=' + encodeURIComponent(cid) + '&maxResults=20&order=date&type=video');
+    const ids = (search.items || []).map(it => it.id?.videoId).filter(Boolean);
+    if (!ids.length) return res.json({ items: [], videos: [], source: 'Live YouTube API', transparency: 'Real' });
+    const vids = await youtubeApi('videos?part=snippet,statistics,contentDetails&id=' + encodeURIComponent(ids.join(',')));
+    const videos = (vids.items || []).map(v => ({ id: v.id, title: v.snippet?.title || null, description: v.snippet?.description || null, publishedAt: v.snippet?.publishedAt || null, thumbnail_url: v.snippet?.thumbnails?.medium?.url || v.snippet?.thumbnails?.default?.url || null, viewCount: v.statistics?.viewCount ? Number(v.statistics.viewCount) : 0, likeCount: v.statistics?.likeCount ? Number(v.statistics.likeCount) : 0, commentCount: v.statistics?.commentCount ? Number(v.statistics.commentCount) : 0, share_url: 'https://www.youtube.com/watch?v=' + v.id }));
+    res.json({ items: videos, videos, source: 'Live YouTube API', transparency: 'Real' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.get('/api/youtube/analytics', requireYouTube, async (req, res) => {
+  try {
+    const chData = await youtubeApi('channels?part=snippet,statistics,contentDetails&mine=true');
+    const channel = (chData.items && chData.items[0]) || null;
+    if (!channel) return res.status(404).json({ error: 'No YouTube channel found' });
+    if (channel.id) YOUTUBE_STORE.channel_id = channel.id;
+    let videos = [];
+    try {
+      const search = await youtubeApi('search?part=snippet&channelId=' + encodeURIComponent(channel.id) + '&maxResults=20&order=date&type=video');
+      const ids = (search.items || []).map(it => it.id?.videoId).filter(Boolean);
+      if (ids.length) { const vids = await youtubeApi('videos?part=snippet,statistics,contentDetails&id=' + encodeURIComponent(ids.join(','))); videos = (vids.items || []).map(v => ({ id: v.id, title: v.snippet?.title || null, publishedAt: v.snippet?.publishedAt || null, thumbnail_url: v.snippet?.thumbnails?.medium?.url || null, viewCount: v.statistics?.viewCount ? Number(v.statistics.viewCount) : 0, likeCount: v.statistics?.likeCount ? Number(v.statistics.likeCount) : 0, commentCount: v.statistics?.commentCount ? Number(v.statistics.commentCount) : 0, share_url: 'https://www.youtube.com/watch?v=' + v.id })); }
+    } catch(e){}
+    res.json(computeYouTubeAnalytics(channel, videos));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 const PORT = process.env.PORT || 3000;
 // Fail-fast BEFORE listen (V21.3): validate Postgres + encryption key FIRST, only then listen.
 // If validation fails in Production, server does NOT start listening at all.
 (async () => {
   await validateBootConfig();
   await loadTokenOnBoot();
-  app.listen(PORT, () => { console.log(`Backend V21.4 running on ${PORT} | DB: ${pgPool ? 'Postgres (mandatory)' : 'Memory fallback (local-dev only)'} | CORS: ${ALLOWED_ORIGINS.join(', ')} | Session Auth: TikTok=yusef_session, Instagram=ig_session (separate)`); });
+  await loadYouTubeTokenOnBoot();
+  app.listen(PORT, () => { console.log(`Backend V22.1 running on ${PORT} | DB: ${pgPool ? 'Postgres (mandatory)' : 'Memory fallback (local-dev only)'} | CORS: ${ALLOWED_ORIGINS.join(', ')} | Session Auth: TikTok=yusef_session, Instagram=ig_session, YouTube=yt_session (separate)`); });
 })();
