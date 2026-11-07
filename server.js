@@ -1,13 +1,15 @@
+
 // Instagram Intelligence - Secure Backend
 // Youssef Elabyad @yusef_elabyad | Instagram ID 17841405344844788
-const 【entity-express¦canonical_name=express】 = require('【entity-express¦canonical_name=express】');
+// Uses System User Token from Environment Variable - NEVER in frontend code
+const express = require('express');
 const cors = require('cors');
-const app = 【entity-express¦canonical_name=express】();
+const app = express();
 app.use(cors());
-app.use(【entity-express¦canonical_name=express】.json());
+app.use(express.json());
 
 const IG_ID = process.env.INSTAGRAM_ID || '17841405344844788';
-const TOKEN = process.env.INSTAGRAM_ACCESS_TOKEN;
+const TOKEN = process.env.INSTAGRAM_ACCESS_TOKEN; // Set in Railway/Vercel Env Vars
 const FB_API = 'https://graph.facebook.com/v21.0';
 
 async function fbFetch(path) {
@@ -15,7 +17,7 @@ async function fbFetch(path) {
   const url = `${FB_API}${path}${path.includes('?') ? '&' : '?'}access_token=${TOKEN}`;
   const r = await fetch(url);
   const data = await r.json();
-  if (data.error && data.error.code && data.error.code !== 'ok') throw new Error(data.error.message || data.error.code);
+  if (data.error) throw new Error(data.error.message);
   return data;
 }
 
@@ -30,7 +32,7 @@ app.get('/api/me', async (req, res) => {
 
 app.get('/api/profile', async (req, res) => {
   try {
-    const data = await fbFetch(`/${IG_ID}?fields=id,username,name,biography,media_count,followers_count,follows_count,profile_picture_url,website`);
+    const data = await fbFetch(`/${IG_ID}?fields=id,username,account_type,media_count,followers_count,follows_count,biography,profile_picture_url,website`);
     res.json({ ...data, source: 'Live API' });
   } catch (e) { res.status(500).json({ error: e.message, source: 'Live API' }); }
 });
@@ -79,7 +81,7 @@ app.get('/api/tiktok/callback', async (req, res) => {
     const data = await r.json();
     if (data.error) throw new Error(data.error_description || data.error);
     TIKTOK_TOKEN = data.access_token;
-    res.send(`<h1>TikTok connected ✅</h1><p>Token saved in backend. You can close this and open your dashboard.</p><p><a href="https://yusef-delta.vercel.app">Open Dashboard</a></p>`);
+    res.send(`<h1>TikTok connected</h1><p>Token saved in backend. You can close this and open your dashboard.</p>`);
   } catch (e) { res.status(500).send(`Token exchange failed: ${e.message}`); }
 });
 
