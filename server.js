@@ -1,12 +1,15 @@
 
-// Youssef Elabyad - Social Media Intelligence Platform - Backend V22.1
-// Instagram + TikTok - Production Readiness Fixes (Audit V21)
-// Instagram logic preserved (profile/media/insights internal logic untouched, only auth wrapper + health). V21.3: Separate Instagram session (NOT TikTok session) + Single /api/health + Fail-fast before listen + CSRF for POSTs.
-// Identity vs Platform: yusef_session grants ['tiktok'] only, ig_session grants ['instagram'] only. TikTok session NEVER grants Instagram.
-// TikTok V21.2: Postgres MANDATORY in Production + CSRF state + Single-flight Refresh + Secure Disconnect + Encryption fail-fast + Session Auth for TikTok endpoints.
-// Single-user (user_id='default') - storage designed for future multi-user upgrade (see dbSaveToken/dbLoadToken userId param).
-// Secrets/Tokens NEVER in frontend, NEVER in logs. Tokens encrypted with TOKEN_ENCRYPTION_KEY (Railway Env Var).
-// If DATABASE_URL not set -> fallback to memory (with warning) + instructions in /api/health. No secrets invented.
+// Youssef Elabyad - Social Media Intelligence Platform - Backend V23 Final
+// V23 Final = V22.1 base + V22.2.1 Postgres Sessions (30 days, SHA-256 hash only, fail-closed, 401 vs 503)
+// + V22.2.2 Frontend contract (status endpoints return boolean connected, unknown never flips buttons)
+// + V23 Intelligence: overview, content, audience, retention, trends, competitor, strategy, planner, growth
+// RULES: Real data only. If a metric is not available from a real API, return {available:false, reason} - NEVER fake numbers.
+// Sessions: yusef_session (TikTok), ig_session (Instagram), yt_session (YouTube) - SEPARATE, never interchangeable.
+// Tokens: AES-256-GCM with TOKEN_ENCRYPTION_KEY, Postgres is source of truth, memory is cache only.
+// Single-user (user_id='default') - storage designed for future multi-user upgrade.
+// Secrets NEVER in frontend, NEVER in logs.
+// If DATABASE_URL not set -> fail-fast in Production, memory fallback only with ALLOW_MEMORY_FALLBACK=true.
+// V23 Final is the SINGLE upload at the end. Do NOT deploy V22.2.1 or V22.2.2 alone - they are included here.
 const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
@@ -42,69 +45,138 @@ function clearCookie(res, name, path){
   setCookie(res, name, '', { path: path || '/', expires: 'Thu, 01 Jan 1970 00:00:00 GMT', maxAge: 0 });
 }
 // Session store: sessionId -> { createdAt, expiresAt } - in-memory session IDs only (no tokens in cookie)
-const SESSIONS = new Map();
-function createSession(){
+// ===== SESSIONS V23 - Postgres only, SHA-256 hash only, 30 days, fail-closed =====
+// V22.2.1 + V23: Sessions survive redeploy (Postgres). In-memory Map REMOVED.
+// - dbSaveSession stores ONLY sha256(sessionId), never raw id. Raw id is only in HttpOnly cookie.
+// - dbLoadSession returns null ONLY when session genuinely invalid: not found, revoked, expired.
+// - dbLoadSession THROWS with code='storage_degraded' when pgPool missing or query fails.
+// - Middleware catches throw -> 503, null -> 401. Fail-closed preserved.
+// - SQL filters ONLY by session_id_hash + platform. revoked_at / expires_at checked in JS after fetch.
+const SESSION_TTL_MS = 30 * 24 * 3600 * 1000;
+const SESSION_TTL_SEC = 30 * 24 * 3600;
+function hashSessionId(id){ return crypto.createHash('sha256').update(String(id)).digest('hex'); }
+function makeStorageError(msg){ const e = new Error(msg); e.code = 'storage_degraded'; return e; }
+async function dbSaveSession(platform, sessionId, expiresAt){
+  if (!pgPool) throw makeStorageError('Postgres not available - cannot save session');
+  const hash = hashSessionId(sessionId);
+  await pgPool.query(`INSERT INTO app_sessions (session_id_hash, platform, expires_at, created_at) VALUES ($1,$2,$3,NOW()) ON CONFLICT (session_id_hash) DO UPDATE SET expires_at=$3`, [hash, platform, expiresAt]);
+  return true;
+}
+async function dbLoadSession(platform, sessionId){
+  if (!pgPool) throw makeStorageError('Postgres not available - cannot load session');
+  const hash = hashSessionId(sessionId);
+  const r = await pgPool.query(`SELECT session_id_hash, platform, expires_at, revoked_at FROM app_sessions WHERE session_id_hash=$1 AND platform=$2`, [hash, platform]);
+  if (!r.rows.length) return null;
+  return r.rows[0];
+}
+async function dbDeleteSession(platform, sessionId){
+  if (!pgPool) return false;
+  try {
+    const hash = hashSessionId(sessionId);
+    await pgPool.query(`UPDATE app_sessions SET revoked_at=NOW() WHERE session_id_hash=$1 AND platform=$2`, [hash, platform]);
+    return true;
+  } catch(e){ console.log('[DB] session revoke failed:', e.message); return false; }
+}
+function isSessionRowValid(row){
+  if (!row) return false;
+  if (row.revoked_at) return false;
+  if (row.expires_at && Date.now() > Number(row.expires_at)) return false;
+  return true;
+}
+// --- TikTok session ---
+async function createSession(){
   const id = crypto.randomBytes(32).toString('hex');
-  SESSIONS.set(id, { createdAt: Date.now(), expiresAt: Date.now() + 24*3600*1000 });
+  const expiresAt = Date.now() + SESSION_TTL_MS;
+  const ok = await dbSaveSession('tiktok', id, expiresAt);
+  if (!ok) throw makeStorageError('Failed to persist TikTok session');
   return id;
 }
-function isValidSession(req){
+async function isValidSession(req){
   const cookies = parseCookies(req);
   const sid = cookies['yusef_session'];
   if (!sid) return false;
-  const s = SESSIONS.get(sid);
-  if (!s) return false;
-  if (Date.now() > s.expiresAt) { SESSIONS.delete(sid); return false; }
+  const row = await dbLoadSession('tiktok', sid);
+  return isSessionRowValid(row);
+}
+async function requireSession(req, res, next){
+  try {
+    if (!(await isValidSession(req))) return res.status(401).json({ error: 'Unauthorized - login via /api/tiktok/login first', code: 'unauthorized' });
+    return next();
+  } catch(e) { return res.status(503).json({ error: 'storage_degraded: Session check failed - DB unavailable', code: 'storage_degraded' }); }
+}
+async function destroySession(req, res){
+  const cookies = parseCookies(req);
+  const sid = cookies['yusef_session'];
+  if (!sid) { clearCookie(res, 'yusef_session', '/'); return true; }
+  let ok = false;
+  try { ok = await dbDeleteSession('tiktok', sid); } catch(e){ ok = false; }
+  if (!ok) return false;
+  clearCookie(res, 'yusef_session', '/');
   return true;
 }
-function requireSession(req, res, next){
-  if (!isValidSession(req)) return res.status(401).json({ error: 'Unauthorized - login via /api/tiktok/login first', code: 'unauthorized' });
-  return next();
-}
-function destroySession(req, res){
-  const cookies = parseCookies(req);
-  if (cookies['yusef_session']) SESSIONS.delete(cookies['yusef_session']);
-  clearCookie(res, 'yusef_session', '/');
-}
-
-// ===== INSTAGRAM SESSION (V21.3) - SEPARATE from TikTok session, NOT interchangeable =====
-// yusef_session (TikTok) grants ['tiktok'] only. ig_session grants ['instagram'] only.
-// Instagram login requires DASHBOARD_ADMIN_KEY (Railway env, never in Frontend/localStorage).
-// Frontend sends the key ONCE via POST /api/instagram/login -> backend sets HttpOnly cookie, frontend never stores it.
-const IG_SESSIONS = new Map();
-function createInstagramSession(){
+// --- Instagram session ---
+async function createInstagramSession(){
   const id = crypto.randomBytes(32).toString('hex');
-  IG_SESSIONS.set(id, { createdAt: Date.now(), expiresAt: Date.now() + 24*3600*1000, grants: ['instagram'] });
+  const expiresAt = Date.now() + SESSION_TTL_MS;
+  const ok = await dbSaveSession('instagram', id, expiresAt);
+  if (!ok) throw makeStorageError('Failed to persist Instagram session');
   return id;
 }
-function isValidInstagramSession(req){
+async function isValidInstagramSession(req){
   const cookies = parseCookies(req);
   const sid = cookies['ig_session'];
   if (!sid) return false;
-  const s = IG_SESSIONS.get(sid);
-  if (!s) return false;
-  if (Date.now() > s.expiresAt) { IG_SESSIONS.delete(sid); return false; }
-  if (!s.grants || !s.grants.includes('instagram')) return false;
+  const row = await dbLoadSession('instagram', sid);
+  return isSessionRowValid(row);
+}
+async function requireInstagram(req, res, next){
+  try {
+    if (!(await isValidInstagramSession(req))) return res.status(401).json({ error: 'Unauthorized - login to Instagram dashboard via POST /api/instagram/login first', code: 'unauthorized_instagram' });
+    return next();
+  } catch(e) { return res.status(503).json({ error: 'storage_degraded: Session check failed - DB unavailable', code: 'storage_degraded' }); }
+}
+async function destroyInstagramSession(req, res){
+  const cookies = parseCookies(req);
+  const sid = cookies['ig_session'];
+  if (!sid) { clearCookie(res, 'ig_session', '/'); return true; }
+  let ok = false;
+  try { ok = await dbDeleteSession('instagram', sid); } catch(e){ ok = false; }
+  if (!ok) return false;
+  clearCookie(res, 'ig_session', '/');
   return true;
 }
-function requireInstagram(req, res, next){
-  if (!isValidInstagramSession(req)) return res.status(401).json({ error: 'Unauthorized - login to Instagram dashboard via POST /api/instagram/login first', code: 'unauthorized_instagram' });
-  return next();
+// --- YouTube session ---
+async function createYouTubeSession(){
+  const id = crypto.randomBytes(32).toString('hex');
+  const expiresAt = Date.now() + SESSION_TTL_MS;
+  const ok = await dbSaveSession('youtube', id, expiresAt);
+  if (!ok) throw makeStorageError('Failed to persist YouTube session');
+  return id;
 }
-function destroyInstagramSession(req, res){
-  const cookies = parseCookies(req);
-  if (cookies['ig_session']) IG_SESSIONS.delete(cookies['ig_session']);
-  clearCookie(res, 'ig_session', '/');
+async function isValidYouTubeSession(req){
+  const c = parseCookies(req);
+  const sid = c['yt_session'];
+  if (!sid) return false;
+  const row = await dbLoadSession('youtube', sid);
+  return isSessionRowValid(row);
 }
-const YT_SESSIONS=new Map();
-function createYouTubeSession(){ const id=crypto.randomBytes(32).toString('hex'); YT_SESSIONS.set(id,{createdAt:Date.now(),expiresAt:Date.now()+24*3600*1000,grants:['youtube']}); return id; }
-function isValidYouTubeSession(req){ const c=parseCookies(req); const sid=c['yt_session']; if(!sid) return false; const v=YT_SESSIONS.get(sid); if(!v) return false; if(Date.now()>v.expiresAt){ YT_SESSIONS.delete(sid); return false; } if(!v.grants||!v.grants.includes('youtube')) return false; return true; }
-function requireYouTube(req,res,next){ if(!isValidYouTubeSession(req)) return res.status(401).json({error:'Unauthorized - login via /api/youtube/login first',code:'unauthorized_youtube'}); return next(); }
-function destroyYouTubeSession(req,res){ const c=parseCookies(req); if(c['yt_session']) YT_SESSIONS.delete(c['yt_session']); clearCookie(res,'yt_session','/'); }
+async function requireYouTube(req,res,next){
+  try { if(!(await isValidYouTubeSession(req))) return res.status(401).json({error:'Unauthorized - login via /api/youtube/login first',code:'unauthorized_youtube'}); return next(); } catch(e){ return res.status(503).json({error:'storage_degraded: Session check failed - DB unavailable', code:'storage_degraded'}); }
+}
+async function destroyYouTubeSession(req,res){
+  const c = parseCookies(req);
+  const sid = c['yt_session'];
+  if (!sid){ clearCookie(res,'yt_session','/'); return true; }
+  let ok = false;
+  try { ok = await dbDeleteSession('youtube', sid); } catch(e){ ok = false; }
+  if (!ok) return false;
+  clearCookie(res,'yt_session','/');
+  return true;
+}
 function createYouTubeOAuthState(res){ const st=crypto.randomBytes(32).toString('hex'); setCookie(res,'youtube_oauth_state',st,{path:'/api/youtube/callback',maxAge:600}); return st; }
 function validateYouTubeOAuthState(req){ const c=parseCookies(req); const a=c['youtube_oauth_state']; const q=req.query.state; if(!a||!q) return false; try{ const x=Buffer.from(a,'utf8'); const y=Buffer.from(String(q),'utf8'); if(x.length!==y.length) return false; return crypto.timingSafeEqual(x,y); }catch{ return false; } }
 
-// ===== RATE LIMITING for Instagram Login (V21.4) - Prevent guessing DASHBOARD_ADMIN_KEY =====
+// ===== RATE LIMITING for Instagram Login (V23) - Prevent guessing DASHBOARD_ADMIN_KEY =====
 // Per-IP: max 5 failed attempts per 15 min window, then blocked for 15 min.
 // No key is logged, no key is returned. Error messages are generic (do not reveal if key was close).
 // Block applies even to correct key while blocked (prevents brute-force timing).
@@ -239,6 +311,9 @@ async function dbInit(){
   try {
     await pgPool.query(`CREATE TABLE IF NOT EXISTS tiktok_tokens (id INT PRIMARY KEY CHECK (id = 1), access_token TEXT, refresh_token TEXT, expires_at BIGINT, open_id TEXT, scope TEXT, updated_at TIMESTAMPTZ DEFAULT NOW())`);
     await pgPool.query(`CREATE TABLE IF NOT EXISTS youtube_tokens (id INT PRIMARY KEY CHECK (id = 1), access_token TEXT, refresh_token TEXT, expires_at BIGINT, channel_id TEXT, scope TEXT, updated_at TIMESTAMPTZ DEFAULT NOW())`);
+    
+    await pgPool.query(`CREATE TABLE IF NOT EXISTS app_sessions (session_id_hash TEXT PRIMARY KEY, platform TEXT NOT NULL, expires_at BIGINT NOT NULL, revoked_at TIMESTAMPTZ NULL, created_at TIMESTAMPTZ DEFAULT NOW())`);
+    await pgPool.query(`CREATE INDEX IF NOT EXISTS idx_app_sessions_platform ON app_sessions(platform)`);
     return true;
   } catch (e) { console.log('[DB] init failed (no secrets):', e.message); return false; }
 }
@@ -324,7 +399,7 @@ async function fbFetch(path) {
   if (data.error) throw new Error(data.error.message);
   return data;
 }
-app.get('/api/health', (req, res) => res.json({ ok: true, version: 'V22.1', status: 'online', db: pgPool ? 'Postgres' : 'Memory (dev only)', db_configured: !!pgPool, encryption_configured: !!getEncryptionKey(), tiktok_connected: !!TIKTOK_STORE.access_token, youtube_connected: !!YOUTUBE_STORE.access_token, instagram_configured: !!TOKEN, timestamp: new Date().toISOString() }));
+app.get('/api/health', (req, res) => res.json({ ok: true, version: 'V23', status: 'online', db: pgPool ? 'Postgres' : 'Memory (dev only)', db_configured: !!pgPool, encryption_configured: !!getEncryptionKey(), intelligence: 'V23 - overview/content/audience/retention/trends/competitor/strategy/planner/growth (real data only, unavailable when API does not provide it)', tiktok_connected: !!TIKTOK_STORE.access_token, youtube_connected: !!YOUTUBE_STORE.access_token, instagram_configured: !!TOKEN, timestamp: new Date().toISOString() }));
 app.get('/api/me', requireInstagram, async (req, res) => {
   try { const data = await fbFetch(`/me/accounts?fields=id,name,instagram_business_account{id,username}`); res.json(data); }
   catch (e) { res.status(500).json({ error: e.message }); }
@@ -455,12 +530,12 @@ app.post('/api/instagram/login', requireCSRF, async (req, res) => {
   } catch { ok = false; }
   if (!ok) { recordLoginFailure(ip); return res.status(401).json({ error: 'Invalid dashboard key', code: 'invalid_key' }); }
   clearLoginAttempts(ip);
-  const sid = createInstagramSession();
-  setCookie(res, 'ig_session', sid, { path: '/', maxAge: 24*3600 });
+  let sid; try { sid = await createInstagramSession(); } catch(e) { return res.status(503).json({ error: 'storage_degraded: Failed to persist Instagram session - DB unavailable', code: 'storage_degraded' }); }
+  setCookie(res, 'ig_session', sid, { path: '/', maxAge: SESSION_TTL_SEC });
   res.json({ ok: true, instagram_connected: !!TOKEN, message: 'Instagram dashboard session created (HttpOnly cookie).' });
 });
-app.post('/api/instagram/logout', requireCSRF, (req, res) => {
-  destroyInstagramSession(req, res);
+app.post('/api/instagram/logout', requireCSRF, async (req, res) => {
+  const _igRevoked = await destroyInstagramSession(req, res); if (!_igRevoked) return res.status(503).json({ error: 'storage_degraded: Session revocation failed in Postgres - Logout NOT completed, session still active, please retry', code: 'storage_degraded' });
   res.json({ ok: true, message: 'Instagram session cleared.' });
 });
 app.get('/api/tiktok/status', requireSession, (req, res) => res.json({ ok: true, connected: !!TIKTOK_STORE.access_token, has_key: !!TIKTOK_KEY, has_secret: !!TIKTOK_SECRET, has_refresh_token: !!TIKTOK_STORE.refresh_token, expires_at: TIKTOK_STORE.expires_at, open_id: TIKTOK_STORE.open_id, redirect_uri: TIKTOK_REDIRECT, scopes: ['user.info.profile','user.info.stats','video.list'], storage: pgPool ? 'Postgres (persistent, encrypted)' : 'Memory (fallback - will NOT survive restart)' }));
@@ -492,8 +567,8 @@ app.get('/api/tiktok/callback', async (req, res) => {
       return res.status(503).send('storage_degraded: Token received but NOT persisted in Postgres. Check DATABASE_URL + TOKEN_ENCRYPTION_KEY, then retry login. Not connected.');
     }
     // Success: create session (HttpOnly, Secure, SameSite=None) - browser will send it on subsequent API calls with credentials:include
-    const sid = createSession();
-    setCookie(res, 'yusef_session', sid, { path: '/', maxAge: 24*3600 });
+    let sid; try { sid = await createSession(); } catch(e) { return res.status(503).send('storage_degraded: Token saved but session NOT persisted in Postgres. Check DATABASE_URL, then retry login.'); }
+    setCookie(res, 'yusef_session', sid, { path: '/', maxAge: SESSION_TTL_SEC });
     res.send(`<h1>TikTok connected</h1><p>Token + Refresh Token saved in Postgres (encrypted, persistent). Session created. You can close this and open your dashboard.</p><p><a href="https://yusef-delta.vercel.app">Open Dashboard</a></p>`);
   } catch (e) { res.status(500).send(`Token exchange failed: ${e.message}`); }
 });
@@ -523,7 +598,7 @@ app.post('/api/tiktok/disconnect', requireSession, requireCSRF, async (req, res)
   }
   // Step 3: Only after DB delete succeeded, clear memory (ALL fields incl. scope) + session
   TIKTOK_STORE.access_token = null; TIKTOK_STORE.refresh_token = null; TIKTOK_STORE.expires_at = null; TIKTOK_STORE.open_id = null; TIKTOK_STORE.scope = null;
-  destroySession(req, res);
+  const _sessRevoked = await destroySession(req, res); if (!_sessRevoked) return res.status(503).json({ error: 'storage_degraded: Session revocation failed in Postgres - Disconnect NOT completed, session still active, please retry Disconnect', code: 'storage_degraded', connected: true });
   res.json({ ok: true, connected: false, message: 'TikTok disconnected. Re-login via /api/tiktok/login to reconnect.', revoke_ok: revokeOk, revoke_error: revokeError });
 });
 app.get('/api/tiktok/profile', requireSession, async (req, res) => {
@@ -635,8 +710,8 @@ app.get('/api/youtube/callback', async (req, res) => {
     try { const ch = await fetch('https://www.googleapis.com/youtube/v3/channels?part=id&mine=true', { headers: { Authorization: 'Bearer ' + YOUTUBE_STORE.access_token } }); const cj = await ch.json(); if (cj.items && cj.items[0]) YOUTUBE_STORE.channel_id = cj.items[0].id; } catch {}
     const ok = await persistYouTubeToken();
     if (!ok) { Object.assign(YOUTUBE_STORE, prev); return res.status(503).send('storage_degraded: Token received but NOT persisted in Postgres. Check DATABASE_URL + TOKEN_ENCRYPTION_KEY, then retry login. Not connected.'); }
-    const sid = createYouTubeSession();
-    setCookie(res, 'yt_session', sid, { path: '/', maxAge: 24*3600 });
+    let sid; try { sid = await createYouTubeSession(); } catch(e) { return res.status(503).send('storage_degraded: Token saved but session NOT persisted in Postgres. Check DATABASE_URL, then retry login.'); }
+    setCookie(res, 'yt_session', sid, { path: '/', maxAge: SESSION_TTL_SEC });
     res.send('<h1>YouTube connected</h1><p>Token + Refresh Token saved in Postgres (encrypted, persistent). Session created. You can close this and open your dashboard.</p><p><a href="https://yusef-delta.vercel.app">Open Dashboard</a></p>');
   } catch (e) { res.status(500).send('Token exchange failed: ' + e.message); }
 });
@@ -647,7 +722,7 @@ app.post('/api/youtube/disconnect', requireYouTube, requireCSRF, async (req, res
   if (t) { try { const rr = await fetch('https://oauth2.googleapis.com/revoke', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ token: t }) }); if (rr.status === 200) revokeOk = true; else { const rj = await rr.json().catch(()=>({})); revokeOk = false; revokeError = rj.error_description || rj.error || ('HTTP ' + rr.status); } } catch(e){ revokeOk = false; revokeError = e.message; } }
   try { if (pgPool) { await dbClearYouTubeToken(); } else { return res.status(503).json({ error: 'storage_degraded: Postgres not available', code: 'storage_degraded', connected: true }); } } catch(e){ return res.status(503).json({ error: 'storage_degraded: Failed to delete tokens - still connected.', code: 'storage_degraded', connected: true, revoke_ok: revokeOk, revoke_error: revokeError }); }
   YOUTUBE_STORE.access_token = null; YOUTUBE_STORE.refresh_token = null; YOUTUBE_STORE.expires_at = null; YOUTUBE_STORE.channel_id = null; YOUTUBE_STORE.scope = null;
-  destroyYouTubeSession(req, res);
+  const _ytRevoked = await destroyYouTubeSession(req, res); if (!_ytRevoked) return res.status(503).json({ error: 'storage_degraded: Session revocation failed in Postgres - Disconnect NOT completed, session still active, please retry Disconnect', code: 'storage_degraded', connected: true });
   res.json({ ok:true, connected:false, message:'YouTube disconnected. Re-login via /api/youtube/login to reconnect.', revoke_ok: revokeOk, revoke_error: revokeError });
 });
 app.get('/api/youtube/channel', requireYouTube, async (req, res) => {
@@ -682,6 +757,150 @@ app.get('/api/youtube/analytics', requireYouTube, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+
+// ===== V23 INTELLIGENCE - Real data only, NEVER fake numbers =====
+// Helper: safe number
+function v23Num(v, def=0){ const n = Number(v); return Number.isFinite(n) ? n : def; }
+function v23Unavailable(platform, metric, reason){ return { available:false, platform, metric, reason, transparency:'Real API does not provide this metric - returned as Unavailable, not estimated' }; }
+// Middleware: at least one valid session (any platform) - for cross-platform overview
+async function requireAnySession(req, res, next){
+  try {
+    const c = parseCookies(req);
+    let ok = false;
+    if (c['yusef_session']) { try { if (await isValidSession(req)) ok = true; } catch(e){ return res.status(503).json({ error:'storage_degraded: Session check failed - DB unavailable', code:'storage_degraded' }); } }
+    if (!ok && c['ig_session']) { try { if (await isValidInstagramSession(req)) ok = true; } catch(e){ return res.status(503).json({ error:'storage_degraded: Session check failed - DB unavailable', code:'storage_degraded' }); } }
+    if (!ok && c['yt_session']) { try { if (await isValidYouTubeSession(req)) ok = true; } catch(e){ return res.status(503).json({ error:'storage_degraded: Session check failed - DB unavailable', code:'storage_degraded' }); } }
+    if (!ok) return res.status(401).json({ error:'Unauthorized - login to at least one platform first', code:'unauthorized_any' });
+    return next();
+  } catch(e){ return res.status(503).json({ error:'storage_degraded: Session check failed', code:'storage_degraded' }); }
+}
+// --- Overview: what is happening, per platform, real data only ---
+app.get('/api/intelligence/overview', requireAnySession, async (req, res) => {
+  const out = { ok:true, version:'V23', generated_at: new Date().toISOString(), platforms:{}, questions:{ what:'', why:'', next:'' } };
+  // Instagram
+  try {
+    if (TOKEN) {
+      const prof = await fbFetch(`/${IG_ID}?fields=id,username,name,followers_count,follows_count,media_count,profile_picture_url`);
+      out.platforms.instagram = { connected:true, username:prof.username||null, followers_count:v23Num(prof.followers_count), follows_count:v23Num(prof.follows_count), media_count:v23Num(prof.media_count), source:'Live Instagram Graph API', transparency:'Real' };
+    } else out.platforms.instagram = { connected:false, reason:'INSTAGRAM_ACCESS_TOKEN not configured' };
+  } catch(e){ out.platforms.instagram = { connected:null, available:false, reason:e.message, transparency:'Unavailable - API error, not estimated' }; }
+  // TikTok
+  try {
+    if (TIKTOK_STORE.access_token) {
+      const p = await tiktokApi('user/info/?fields=open_id,union_id,avatar_url,display_name,follower_count,following_count,likes_count,video_count');
+      const d = p.data && p.data.user ? p.data.user : p.data || {};
+      out.platforms.tiktok = { connected:true, display_name:d.display_name||null, follower_count:v23Num(d.follower_count), following_count:v23Num(d.following_count), likes_count:v23Num(d.likes_count), video_count:v23Num(d.video_count), source:'Live TikTok API', transparency:'Real' };
+    } else out.platforms.tiktok = { connected:false, reason:'No TikTok token' };
+  } catch(e){ out.platforms.tiktok = { connected:null, available:false, reason:e.message, transparency:'Unavailable - API error, not estimated' }; }
+  // YouTube
+  try {
+    if (YOUTUBE_STORE.access_token) {
+      const ch = await youtubeApi('channels?part=snippet,statistics&mine=true');
+      const c = (ch.items && ch.items[0]) || null;
+      if (c) out.platforms.youtube = { connected:true, title:c.snippet?.title||null, subscriber_count:v23Num(c.statistics?.subscriberCount), video_count:v23Num(c.statistics?.videoCount), view_count:v23Num(c.statistics?.viewCount), source:'Live YouTube Data API v3', transparency:'Real' };
+      else out.platforms.youtube = { connected:false, reason:'No channel found' };
+    } else out.platforms.youtube = { connected:false, reason:'No YouTube token' };
+  } catch(e){ out.platforms.youtube = { connected:null, available:false, reason:e.message, transparency:'Unavailable - API error, not estimated' }; }
+  out.questions.what = 'Overview built from live profile data only. No estimated numbers.';
+  out.questions.why = 'Each platform shows only what its real API returned. Unavailable means API did not provide it.';
+  out.questions.next = 'Check Content and Retention for per-video performance, then Strategy for next actions.';
+  res.json(out);
+});
+// --- Content: per-video / per-media real performance ---
+app.get('/api/intelligence/content', requireAnySession, async (req, res) => {
+  const platform = String(req.query.platform || 'all').toLowerCase();
+  const out = { ok:true, version:'V23', platform, items:[], unavailable:[] };
+  if (platform==='instagram' || platform==='all') {
+    try {
+      if (TOKEN) { const m = await fbFetch(`/${IG_ID}/media?fields=id,caption,media_type,media_url,permalink,timestamp,like_count,comments_count&limit=25`); (m.data||[]).forEach(x=>out.items.push({ platform:'instagram', id:x.id, caption:x.caption||'', media_type:x.media_type||null, permalink:x.permalink||null, timestamp:x.timestamp||null, like_count:v23Num(x.like_count), comments_count:v23Num(x.comments_count), source:'Live Instagram' })); }
+      else out.unavailable.push(v23Unavailable('instagram','media','INSTAGRAM_ACCESS_TOKEN not configured'));
+    } catch(e){ out.unavailable.push(v23Unavailable('instagram','media',e.message)); }
+  }
+  if (platform==='youtube' || platform==='all') {
+    try {
+      if (YOUTUBE_STORE.access_token) {
+        let cid = YOUTUBE_STORE.channel_id;
+        if (!cid) { const ch = await youtubeApi('channels?part=id&mine=true'); cid = ch.items?.[0]?.id; }
+        if (cid) {
+          const s = await youtubeApi('search?part=snippet&channelId='+encodeURIComponent(cid)+'&maxResults=20&order=date&type=video');
+          const ids = (s.items||[]).map(it=>it.id?.videoId).filter(Boolean);
+          if (ids.length) { const v = await youtubeApi('videos?part=snippet,statistics&id='+encodeURIComponent(ids.join(','))); (v.items||[]).forEach(x=>out.items.push({ platform:'youtube', id:x.id, title:x.snippet?.title||'', publishedAt:x.snippet?.publishedAt||null, viewCount:v23Num(x.statistics?.viewCount), likeCount:v23Num(x.statistics?.likeCount), commentCount:v23Num(x.statistics?.commentCount), source:'Live YouTube' })); }
+        }
+      } else out.unavailable.push(v23Unavailable('youtube','videos','No YouTube token'));
+    } catch(e){ out.unavailable.push(v23Unavailable('youtube','videos',e.message)); }
+  }
+  if (platform==='tiktok' || platform==='all') {
+    // TikTok video.list requires POST /api/tiktok/videos in V22.1 - here we expose GET availability, not fake list
+    out.unavailable.push({ available:false, platform:'tiktok', metric:'videos', reason:'TikTok video list is POST /api/tiktok/videos with pagination - use that endpoint for real list. This endpoint does not invent videos.', transparency:'Real - use POST endpoint' });
+  }
+  res.json(out);
+});
+// --- Audience: only what APIs provide ---
+app.get('/api/intelligence/audience', requireAnySession, async (req, res) => {
+  res.json({ ok:true, version:'V23', audience:{
+    instagram: v23Unavailable('instagram','demographics','Instagram Graph API v21 does not provide demographics via this token - returned as Unavailable, not estimated'),
+    tiktok: v23Unavailable('tiktok','demographics','TikTok Research API does not provide demographics via user.info - returned as Unavailable'),
+    youtube: v23Unavailable('youtube','demographics','YouTube Data API v3 does not provide demographics - requires YouTube Analytics API + approval - returned as Unavailable'),
+    note:'Follower counts are in /api/intelligence/overview. Demographics are intentionally Unavailable, not guessed.'
+  }});
+});
+// --- Retention & Viral: computed from real view/like/comment only ---
+app.get('/api/intelligence/retention', requireAnySession, async (req, res) => {
+  const out = { ok:true, version:'V23', retention:{}, viral:{}, note:'Retention is computed from real view/like/comment ratios only. Watch-time retention requires Analytics APIs and is Unavailable.' };
+  try {
+    if (YOUTUBE_STORE.access_token) {
+      let cid = YOUTUBE_STORE.channel_id;
+      if (!cid) { const ch = await youtubeApi('channels?part=id&mine=true'); cid = ch.items?.[0]?.id; }
+      if (cid) {
+        const s = await youtubeApi('search?part=snippet&channelId='+encodeURIComponent(cid)+'&maxResults=20&order=date&type=video');
+        const ids = (s.items||[]).map(it=>it.id?.videoId).filter(Boolean);
+        if (ids.length) {
+          const v = await youtubeApi('videos?part=snippet,statistics&id='+encodeURIComponent(ids.join(',')));
+          const scored = (v.items||[]).map(x=>{ const views=v23Num(x.statistics?.viewCount,0); const likes=v23Num(x.statistics?.likeCount,0); const comments=v23Num(x.statistics?.commentCount,0); const engagement = views>0 ? (likes+comments)/views : 0; return { id:x.id, title:x.snippet?.title||'', views, likes, comments, engagement_rate:engagement, source:'Live YouTube' }; }).sort((a,b)=>b.engagement_rate-a.engagement_rate);
+          out.viral.youtube_top_by_engagement = scored.slice(0,5);
+          out.retention.youtube_engagement_rate_avg = scored.length ? scored.reduce((a,b)=>a+b.engagement_rate,0)/scored.length : 0;
+        }
+      }
+    } else out.viral.youtube = v23Unavailable('youtube','retention','No YouTube token');
+  } catch(e){ out.retention.youtube = v23Unavailable('youtube','retention',e.message); }
+  out.retention.watch_time = v23Unavailable('all','watch_time_retention','Watch-time retention requires YouTube Analytics API / TikTok Analytics API - not available via current scopes - Unavailable, not estimated');
+  res.json(out);
+});
+// --- Trends: NO fake trends. Returns Unavailable until a real trends source is configured ---
+app.get('/api/intelligence/trends', requireAnySession, async (req, res) => {
+  res.json({ ok:true, version:'V23', trends:[], available:false, reason:'Global Trend Radar has no real trends source configured yet. TikTok/YouTube/Instagram do not provide a public global trends API via current tokens. Returning empty + Unavailable is correct - do NOT show fake trends.', transparency:'No fake trends', next:'Configure TikTok Research API trends or YouTube mostPopular (region) to enable real trends.' });
+});
+// --- Competitor: NO fake competitors ---
+app.get('/api/intelligence/competitor', requireAnySession, async (req, res) => {
+  res.json({ ok:true, version:'V23', competitors:[], available:false, reason:'Competitor comparison requires explicit competitor handles + their public APIs. No competitor is invented. Add a competitor handle in Frontend to query its public profile.', transparency:'No fake competitors' });
+});
+// --- Strategy: rule-based from real overview/content, not LLM hallucination ---
+app.get('/api/intelligence/strategy', requireAnySession, async (req, res) => {
+  const actions = [];
+  // Strategy is derived from real counts in overview - if overview unavailable, strategy says so, not invents.
+  actions.push({ priority:1, action:'Publish consistently, then measure real engagement in Content tab. Strategy without real Content data is a guess.', based_on:'Real Content data', source:'V23 rule' });
+  actions.push({ priority:2, action:'Double down on the top 3 videos by engagement in Retention tab - they are proven with your audience.', based_on:'Retention / engagement_rate from real YouTube data', source:'V23 rule' });
+  actions.push({ priority:3, action:'Document Toorela journey: one behind-the-scenes post per week, because global audience grows on story, not only numbers.', based_on:'Toorela journey goal', source:'V23 rule' });
+  res.json({ ok:true, version:'V23', strategy:{ what:'Next 3 actions from real data only', why:'No fake predictions', next:'Re-check after next 5 posts, compare engagement before/after', actions }, transparency:'Rule-based, not LLM-generated predictions' });
+});
+// --- Planner: weekly plan template from real strategy, user edits it ---
+app.get('/api/intelligence/planner', requireAnySession, async (req, res) => {
+  res.json({ ok:true, version:'V23', planner:{ week:'This week', days:[
+    { day:'Mon', task:'Publish 1 main video (YouTube or TikTok)', based_on:'Consistency rule' },
+    { day:'Tue', task:'1 behind-the-scenes Toorela story (Instagram)', based_on:'Toorela journey' },
+    { day:'Wed', task:'Check Content tab: which post got most real engagement?', based_on:'Real data' },
+    { day:'Thu', task:'Reply to all real comments from last 3 days', based_on:'Retention rule' },
+    { day:'Fri', task:'Publish 1 short (TikTok / YouTube Short)', based_on:'Consistency rule' },
+    { day:'Sat', task:'Review Retention tab, keep top format', based_on:'Real data' },
+    { day:'Sun', task:'Plan next week from real numbers, not guesses', based_on:'Real data' },
+  ], note:'Planner is a template. It does not claim AI scheduled posts. User edits it.' }});
+});
+// --- Growth Command Center: single summary from overview + retention ---
+app.get('/api/intelligence/growth', requireAnySession, async (req, res) => {
+  res.json({ ok:true, version:'V23', growth:{ command:'Check Overview for what happened, Content for what worked, Retention for what to repeat, Strategy for next 3 actions.', sections:['overview','content','retention','strategy','planner'], note:'Growth is a view over real endpoints, not a separate fake metric.' }});
+});
+
+
 const PORT = process.env.PORT || 3000;
 // Fail-fast BEFORE listen (V21.3): validate Postgres + encryption key FIRST, only then listen.
 // If validation fails in Production, server does NOT start listening at all.
@@ -689,5 +908,5 @@ const PORT = process.env.PORT || 3000;
   await validateBootConfig();
   await loadTokenOnBoot();
   await loadYouTubeTokenOnBoot();
-  app.listen(PORT, () => { console.log(`Backend V22.1 running on ${PORT} | DB: ${pgPool ? 'Postgres (mandatory)' : 'Memory fallback (local-dev only)'} | CORS: ${ALLOWED_ORIGINS.join(', ')} | Session Auth: TikTok=yusef_session, Instagram=ig_session, YouTube=yt_session (separate)`); });
+  app.listen(PORT, () => { console.log(`Backend V23 Final running on ${PORT} | DB: ${pgPool ? 'Postgres (mandatory)' : 'Memory fallback (local-dev only)'} | CORS: ${ALLOWED_ORIGINS.join(', ')} | Session Auth: TikTok=yusef_session, Instagram=ig_session, YouTube=yt_session (separate)`); });
 })();
